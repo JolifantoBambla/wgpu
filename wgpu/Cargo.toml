@@ -199,6 +199,8 @@ web-sys = { version = "0.3.60", features = [
     "GpuCompilationMessageType",
     "GpuComputePassDescriptor",
     "GpuComputePassEncoder",
+    "GpuComputePassTimestampLocation",
+    "GpuComputePassTimestampWrite",
     "GpuComputePipeline",
     "GpuComputePipelineDescriptor",
     "GpuCullMode",

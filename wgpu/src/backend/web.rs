@@ -823,6 +823,27 @@ fn map_texture_view_dimension(
     }
 }
 
+fn map_compute_pass_timestamp_location(
+    timestamp_location: crate::ComputePassTimestampLocation,
+) -> web_sys::GpuComputePassTimestampLocation {
+    match timestamp_location {
+        crate::ComputePassTimestampLocation::Beginning => {
+            web_sys::GpuComputePassTimestampLocation::Beginning
+        }
+        crate::ComputePassTimestampLocation::End => web_sys::GpuComputePassTimestampLocation::End,
+    }
+}
+
+fn map_compute_pass_timestamp_write(
+    timestamp_write: &crate::ComputePassTimestampWrite,
+) -> web_sys::GpuComputePassTimestampWrite {
+    web_sys::GpuComputePassTimestampWrite::new(
+        map_compute_pass_timestamp_location(timestamp_write.location),
+        timestamp_write.query_index,
+        &timestamp_write.query_set.id.0,
+    )
+}
+
 fn map_buffer_copy_view(view: crate::ImageCopyBuffer) -> web_sys::GpuImageCopyBuffer {
     let mut mapped = web_sys::GpuImageCopyBuffer::new(&view.buffer.id.0);
     if let Some(bytes_per_row) = view.layout.bytes_per_row {
@@ -2086,6 +2107,14 @@ impl crate::Context for Context {
         if let Some(label) = desc.label {
             mapped_desc.label(label);
         }
+        let mapped_timestamp_writes = desc
+            .timestamp_writes
+            .iter()
+            .map(|timestamp_write| {
+                wasm_bindgen::JsValue::from(map_compute_pass_timestamp_write(timestamp_write))
+            })
+            .collect::<js_sys::Array>();
+        mapped_desc.timestamp_writes(&mapped_timestamp_writes);
         ComputePass(encoder.0.begin_compute_pass_with_descriptor(&mapped_desc))
     }
 
