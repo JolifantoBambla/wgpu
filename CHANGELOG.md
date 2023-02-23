@@ -73,6 +73,7 @@ By @teoxoy in [#3436](https://github.com/gfx-rs/wgpu/pull/3436)
 #### General
 
 - Change type of `mip_level_count` and `array_layer_count` (members of `TextureViewDescriptor` and `ImageSubresourceRange`) from `Option<NonZeroU32>` to `Option<u32>`. By @teoxoy in [#3445](https://github.com/gfx-rs/wgpu/pull/3445)
+- Add `timestamp_writes` member to `ComputePassDescriptor` (also add types `ComputePassTimestampWrite` and `ComputePassTimestampLocation`). By @JolifantoBambla in [#3524](https://github.com/gfx-rs/wgpu/pull/3524)
 
 ### Changes
 
