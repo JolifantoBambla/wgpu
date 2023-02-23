@@ -387,7 +387,7 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
             Some(&*query_set_guard),
         );
 
-        let hal_desc = hal::ComputePassDescriptor { label: base.label };
+        let hal_desc = hal::ComputePassDescriptor { label: base.label, timestamp_writes: &[] };
         unsafe {
             raw.begin_compute_pass(&hal_desc);
         }

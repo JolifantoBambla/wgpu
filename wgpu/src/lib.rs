@@ -688,6 +688,7 @@ impl Drop for RenderBundle {
 /// It can be created with [`Device::create_query_set`].
 ///
 /// Corresponds to [WebGPU `GPUQuerySet`](https://gpuweb.github.io/gpuweb/#queryset).
+#[derive(Debug)]
 pub struct QuerySet {
     context: Arc<C>,
     id: ObjectId,
@@ -1167,6 +1168,33 @@ pub struct RenderPipelineDescriptor<'a> {
 }
 static_assertions::assert_impl_all!(RenderPipelineDescriptor: Send, Sync);
 
+/// The location of a [`ComputePassTimestampWrite`].
+///
+/// Corresponds to [WebGPU `GPUComputePassTimestampLocation`](https://gpuweb.github.io/gpuweb/#enumdef-gpucomputepasstimestamplocation).
+#[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
+#[cfg_attr(feature = "trace", derive(serde::Serialize))]
+#[cfg_attr(feature = "replay", derive(serde::Deserialize))]
+pub enum ComputePassTimestampLocation {
+    /// Beginning of the compute pass.
+    Beginning,
+    /// End of the compute pass.
+    End,
+}
+
+/// Describes a timestamp write within a compute pass.
+///
+/// Corresponds to [WebGPU `GPUComputePassTimestampWrite`](https://gpuweb.github.io/gpuweb/#dictdef-gpucomputepasstimestampwrite).
+#[derive(Clone, Debug)]
+pub struct ComputePassTimestampWrite<'a> {
+    /// The query set to write the timestamp to.
+    pub query_set: &'a QuerySet,
+    /// The index of the timestamp within the query set.
+    pub query_index: u32,
+    /// The location of the timestamp write within the compute pass.
+    pub location: ComputePassTimestampLocation,
+}
+static_assertions::assert_impl_all!(ComputePassDescriptor: Send, Sync);
+
 /// Describes the attachments of a compute pass.
 ///
 /// For use with [`CommandEncoder::begin_compute_pass`].
@@ -1177,6 +1205,11 @@ static_assertions::assert_impl_all!(RenderPipelineDescriptor: Send, Sync);
 pub struct ComputePassDescriptor<'a> {
     /// Debug label of the compute pass. This will show up in graphics debuggers for easy identification.
     pub label: Label<'a>,
+    /// A sequence of [`ComputePassTimestampWrite`] values that define where and when timestamp values will be written for this pass.
+    /// No two entries can have the same [`ComputePassTimestampLocation`].
+    ///
+    /// If this is not empty, [`Features::TIMESTAMP_QUERY`] must be enabled on the device.
+    pub timestamp_writes: &'a [ComputePassTimestampWrite<'a>],
 }
 static_assertions::assert_impl_all!(ComputePassDescriptor: Send, Sync);
 

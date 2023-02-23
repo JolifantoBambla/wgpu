@@ -541,7 +541,7 @@ pub trait CommandEncoder<A: Api>: Send + Sync + fmt::Debug {
     // compute passes
 
     // Begins a compute pass, clears all active bindings.
-    unsafe fn begin_compute_pass(&mut self, desc: &ComputePassDescriptor);
+    unsafe fn begin_compute_pass(&mut self, desc: &ComputePassDescriptor<A>);
     unsafe fn end_compute_pass(&mut self);
 
     unsafe fn set_compute_pipeline(&mut self, pipeline: &A::ComputePipeline);
@@ -1259,9 +1259,23 @@ pub struct RenderPassDescriptor<'a, A: Api> {
     pub multiview: Option<NonZeroU32>,
 }
 
+#[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
+pub enum ComputePassTimestampLocation {
+    Beginning,
+    End,
+}
+
 #[derive(Clone, Debug)]
-pub struct ComputePassDescriptor<'a> {
+pub struct ComputePassTimestampWrite<'a, A: Api> {
+    pub query_set: &'a A::QuerySet,
+    pub query_index: u32,
+    pub location: ComputePassTimestampLocation,
+}
+
+#[derive(Clone, Debug)]
+pub struct ComputePassDescriptor<'a, A: Api> {
     pub label: Label<'a>,
+    pub timestamp_writes: &'a [ComputePassTimestampWrite<'a, A>],
 }
 
 /// Stores if any API validation error has occurred in this process
