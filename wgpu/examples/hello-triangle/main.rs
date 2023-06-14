@@ -122,6 +122,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                             },
                         })],
                         depth_stencil_attachment: None,
+                        timestamp_writes: None,
                     });
                     rpass.set_pipeline(&render_pipeline);
                     rpass.draw(0..3, 0..1);
@@ -145,7 +146,6 @@ fn main() {
     #[cfg(not(target_arch = "wasm32"))]
     {
         env_logger::init();
-        // Temporarily avoid srgb formats for the swapchain on the web
         pollster::block_on(run(event_loop, window));
     }
     #[cfg(target_arch = "wasm32")]

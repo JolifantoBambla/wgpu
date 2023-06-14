@@ -135,6 +135,7 @@ async fn run(event_loop: EventLoop<()>, viewports: Vec<(Window, wgpu::Color)>) {
                                 },
                             })],
                             depth_stencil_attachment: None,
+                            timestamp_writes: None,
                         });
                     }
 
@@ -196,7 +197,6 @@ fn main() {
         }
 
         env_logger::init();
-        // Temporarily avoid srgb formats for the swapchain on the web
         pollster::block_on(run(event_loop, viewports));
     }
     #[cfg(target_arch = "wasm32")]

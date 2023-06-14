@@ -1,5 +1,3 @@
-use std::num::NonZeroU32;
-
 use crate::common::{image::ReadbackBuffers, initialize_test, TestParameters, TestingContext};
 use wasm_bindgen_test::*;
 use wgpu::*;
@@ -45,13 +43,7 @@ fn discarding_depth_target_resets_texture_init_state_check_visible_on_copy_in_sa
             .downlevel_flags(
                 DownlevelFlags::DEPTH_TEXTURE_AND_BUFFER_COPIES | DownlevelFlags::COMPUTE_SHADERS,
             )
-            .limits(Limits::downlevel_defaults())
-            .specific_failure(
-                Some(wgpu::Backends::DX12),
-                Some(5140),
-                Some("Microsoft Basic Render Driver"),
-                false,
-            ),
+            .limits(Limits::downlevel_defaults()),
         |mut ctx| {
             for format in [
                 TextureFormat::Stencil8,
@@ -162,6 +154,7 @@ impl<'ctx> TestCase<'ctx> {
                         store: true,
                     }),
                 }),
+                timestamp_writes: None,
             });
             ctx.queue.submit([encoder.finish()]);
         } else {
@@ -184,7 +177,7 @@ impl<'ctx> TestCase<'ctx> {
                 &data,
                 ImageDataLayout {
                     offset: 0,
-                    bytes_per_row: NonZeroU32::new(bytes_per_row),
+                    bytes_per_row: Some(bytes_per_row),
                     rows_per_image: None,
                 },
                 texture.size(),
@@ -245,6 +238,7 @@ impl<'ctx> TestCase<'ctx> {
                         }),
                     },
                 ),
+                timestamp_writes: None,
             });
     }
 
@@ -268,6 +262,7 @@ impl<'ctx> TestCase<'ctx> {
                         }),
                     },
                 ),
+                timestamp_writes: None,
             });
     }
 
@@ -291,6 +286,7 @@ impl<'ctx> TestCase<'ctx> {
                         }),
                     },
                 ),
+                timestamp_writes: None,
             });
     }
 

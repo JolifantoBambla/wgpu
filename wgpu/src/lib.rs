@@ -19,7 +19,7 @@ use std::{
     fmt::{Debug, Display},
     future::Future,
     marker::PhantomData,
-    num::{NonZeroU32, NonZeroU8},
+    num::NonZeroU32,
     ops::{Bound, Deref, DerefMut, Range, RangeBounds},
     sync::Arc,
     thread,
@@ -567,15 +567,16 @@ impl ComputePipeline {
 pub struct CommandBuffer {
     context: Arc<C>,
     id: Option<ObjectId>,
-    data: Box<Data>,
+    data: Option<Box<Data>>,
 }
 static_assertions::assert_impl_all!(CommandBuffer: Send, Sync);
 
 impl Drop for CommandBuffer {
     fn drop(&mut self) {
         if !thread::panicking() {
-            if let Some(ref id) = self.id {
-                self.context.command_buffer_drop(id, self.data.as_ref());
+            if let Some(id) = self.id.take() {
+                self.context
+                    .command_buffer_drop(&id, self.data.take().unwrap().as_ref());
             }
         }
     }
@@ -688,6 +689,7 @@ impl Drop for RenderBundle {
 /// It can be created with [`Device::create_query_set`].
 ///
 /// Corresponds to [WebGPU `GPUQuerySet`](https://gpuweb.github.io/gpuweb/#queryset).
+#[derive(Debug)]
 pub struct QuerySet {
     context: Arc<C>,
     id: ObjectId,
@@ -771,13 +773,25 @@ static_assertions::assert_impl_all!(BindingResource: Send, Sync);
 pub struct BufferBinding<'a> {
     /// The buffer to bind.
     pub buffer: &'a Buffer,
-    /// Base offset of the buffer. For bindings with `dynamic == true`, this offset
-    /// will be added to the dynamic offset provided in [`RenderPass::set_bind_group`].
+
+    /// Base offset of the buffer, in bytes.
     ///
-    /// The offset has to be aligned to [`Limits::min_uniform_buffer_offset_alignment`]
-    /// or [`Limits::min_storage_buffer_offset_alignment`] appropriately.
+    /// If the [`has_dynamic_offset`] field of this buffer's layout entry is
+    /// `true`, the offset here will be added to the dynamic offset passed to
+    /// [`RenderPass::set_bind_group`] or [`ComputePass::set_bind_group`].
+    ///
+    /// If the buffer was created with [`BufferUsages::UNIFORM`], then this
+    /// offset must be a multiple of
+    /// [`Limits::min_uniform_buffer_offset_alignment`].
+    ///
+    /// If the buffer was created with [`BufferUsages::STORAGE`], then this
+    /// offset must be a multiple of
+    /// [`Limits::min_storage_buffer_offset_alignment`].
+    ///
+    /// [`has_dynamic_offset`]: BindingType::Buffer::has_dynamic_offset
     pub offset: BufferAddress,
-    /// Size of the binding, or `None` for using the rest of the buffer.
+
+    /// Size of the binding in bytes, or `None` for using the rest of the buffer.
     pub size: Option<BufferSize>,
 }
 static_assertions::assert_impl_all!(BufferBinding: Send, Sync);
@@ -825,6 +839,24 @@ impl<V: Default> Default for Operations<V> {
         }
     }
 }
+
+/// Describes the timestamp writes of a render pass.
+///
+/// For use with [`RenderPassDescriptor`].
+/// At least one of `beginning_of_pass_write_index` and `end_of_pass_write_index` must be `Some`.
+///
+/// Corresponds to [WebGPU `GPURenderPassTimestampWrite`](
+/// https://gpuweb.github.io/gpuweb/#dictdef-gpurenderpasstimestampwrites).
+#[derive(Clone, Debug)]
+pub struct RenderPassTimestampWrites<'a> {
+    /// The query set to write to.
+    pub query_set: &'a QuerySet,
+    /// The index of the query at which the start timestamp of the pass is written if any.
+    pub beginning_of_pass_write_index: Option<u32>,
+    /// The index of the query at which the end timestamp of the pass is written if any.
+    pub end_of_pass_write_index: Option<u32>,
+}
+static_assertions::assert_impl_all!(RenderPassTimestampWrites: Send, Sync);
 
 /// Describes a color attachment to a [`RenderPass`].
 ///
@@ -936,7 +968,8 @@ static_assertions::assert_impl_all!(Maintain: Send, Sync);
 pub struct TextureViewDescriptor<'a> {
     /// Debug label of the texture view. This will show up in graphics debuggers for easy identification.
     pub label: Label<'a>,
-    /// Format of the texture view. At this time, it must be the same as the underlying format of the texture.
+    /// Format of the texture view. Either must be the same as the texture format or in the list
+    /// of `view_formats` in the texture's descriptor.
     pub format: Option<TextureFormat>,
     /// The dimension of the texture view. For 1D textures, this must be `D1`. For 2D textures it must be one of
     /// `D2`, `D2Array`, `Cube`, and `CubeArray`. For 3D textures it must be `D3`
@@ -1008,8 +1041,8 @@ pub struct SamplerDescriptor<'a> {
     pub lod_max_clamp: f32,
     /// If this is enabled, this is a comparison sampler using the given comparison function.
     pub compare: Option<CompareFunction>,
-    /// Valid values: 1, 2, 4, 8, and 16.
-    pub anisotropy_clamp: Option<NonZeroU8>,
+    /// Must be at least 1. If this is not 1, all filter modes must be linear.
+    pub anisotropy_clamp: u16,
     /// Border color to use when address_mode is [`AddressMode::ClampToBorder`]
     pub border_color: Option<SamplerBorderColor>,
 }
@@ -1026,9 +1059,9 @@ impl Default for SamplerDescriptor<'_> {
             min_filter: Default::default(),
             mipmap_filter: Default::default(),
             lod_min_clamp: 0.0,
-            lod_max_clamp: std::f32::MAX,
+            lod_max_clamp: 32.0,
             compare: None,
-            anisotropy_clamp: None,
+            anisotropy_clamp: 1,
             border_color: None,
         }
     }
@@ -1083,6 +1116,10 @@ pub struct RenderPassDescriptor<'tex, 'desc> {
     pub color_attachments: &'desc [Option<RenderPassColorAttachment<'tex>>],
     /// The depth and stencil attachment of the render pass, if any.
     pub depth_stencil_attachment: Option<RenderPassDepthStencilAttachment<'tex>>,
+    /// Defines which timestamp values will be written for this pass, and where to write them to.
+    ///
+    /// Requires [`Features::TIMESTAMP_QUERY`] to be enabled.
+    pub timestamp_writes: Option<RenderPassTimestampWrites<'desc>>,
 }
 static_assertions::assert_impl_all!(RenderPassDescriptor: Send, Sync);
 
@@ -1167,16 +1204,38 @@ pub struct RenderPipelineDescriptor<'a> {
 }
 static_assertions::assert_impl_all!(RenderPipelineDescriptor: Send, Sync);
 
+/// Describes the timestamp writes of a compute pass.
+///
+/// For use with [`ComputePassDescriptor`].
+/// At least one of `beginning_of_pass_write_index` and `end_of_pass_write_index` must be `Some`.
+///
+/// Corresponds to [WebGPU `GPUComputePassTimestampWrite`](
+/// https://gpuweb.github.io/gpuweb/#dictdef-gpucomputepasstimestampwrites).
+#[derive(Clone, Debug)]
+pub struct ComputePassTimestampWrites<'a> {
+    /// The query set to write to.
+    pub query_set: &'a QuerySet,
+    /// The index of the query at which the start timestamp of the pass is written if any.
+    pub beginning_of_pass_write_index: Option<u32>,
+    /// The index of the query at which the end timestamp of the pass is written if any.
+    pub end_of_pass_write_index: Option<u32>,
+}
+static_assertions::assert_impl_all!(ComputePassTimestampWrites: Send, Sync);
+
 /// Describes the attachments of a compute pass.
 ///
 /// For use with [`CommandEncoder::begin_compute_pass`].
 ///
 /// Corresponds to [WebGPU `GPUComputePassDescriptor`](
 /// https://gpuweb.github.io/gpuweb/#dictdef-gpucomputepassdescriptor).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct ComputePassDescriptor<'a> {
     /// Debug label of the compute pass. This will show up in graphics debuggers for easy identification.
     pub label: Label<'a>,
+    /// Defines which timestamp values will be written for this pass, and where to write them to.
+    ///
+    /// Requires [`Features::TIMESTAMP_QUERY`] to be enabled.
+    pub timestamp_writes: Option<ComputePassTimestampWrites<'a>>,
 }
 static_assertions::assert_impl_all!(ComputePassDescriptor: Send, Sync);
 
@@ -1346,7 +1405,7 @@ impl Instance {
         target_os = "emscripten",
         feature = "webgl"
     ))]
-    pub unsafe fn from_hal<A: wgc::hub::HalApi>(hal_instance: A::Instance) -> Self {
+    pub unsafe fn from_hal<A: wgc::hal_api::HalApi>(hal_instance: A::Instance) -> Self {
         Self {
             context: Arc::new(unsafe {
                 crate::backend::Context::from_hal_instance::<A>(hal_instance)
@@ -1369,7 +1428,7 @@ impl Instance {
         target_os = "emscripten",
         feature = "webgl"
     ))]
-    pub unsafe fn as_hal<A: wgc::hub::HalApi>(&self) -> Option<&A::Instance> {
+    pub unsafe fn as_hal<A: wgc::hal_api::HalApi>(&self) -> Option<&A::Instance> {
         unsafe {
             self.context
                 .as_any()
@@ -1454,7 +1513,7 @@ impl Instance {
         target_os = "emscripten",
         feature = "webgl"
     ))]
-    pub unsafe fn create_adapter_from_hal<A: wgc::hub::HalApi>(
+    pub unsafe fn create_adapter_from_hal<A: wgc::hal_api::HalApi>(
         &self,
         hal_adapter: hal::ExposedAdapter<A>,
     ) -> Adapter {
@@ -1598,7 +1657,7 @@ impl Instance {
     #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
     pub fn create_surface_from_canvas(
         &self,
-        canvas: &web_sys::HtmlCanvasElement,
+        canvas: web_sys::HtmlCanvasElement,
     ) -> Result<Surface, CreateSurfaceError> {
         let surface = self
             .context
@@ -1615,9 +1674,9 @@ impl Instance {
             #[cfg(any(not(target_arch = "wasm32"), feature = "webgl"))]
             data: Box::new(surface),
             #[cfg(all(target_arch = "wasm32", not(feature = "webgl")))]
-            id: ObjectId::from(surface),
+            id: ObjectId::UNUSED,
             #[cfg(all(target_arch = "wasm32", not(feature = "webgl")))]
-            data: Box::new(()),
+            data: Box::new(surface.1),
             config: Mutex::new(None),
         })
     }
@@ -1634,7 +1693,7 @@ impl Instance {
     #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
     pub fn create_surface_from_offscreen_canvas(
         &self,
-        canvas: &web_sys::OffscreenCanvas,
+        canvas: web_sys::OffscreenCanvas,
     ) -> Result<Surface, CreateSurfaceError> {
         let surface = self
             .context
@@ -1651,9 +1710,9 @@ impl Instance {
             #[cfg(any(not(target_arch = "wasm32"), feature = "webgl"))]
             data: Box::new(surface),
             #[cfg(all(target_arch = "wasm32", not(feature = "webgl")))]
-            id: ObjectId::from(surface),
+            id: ObjectId::UNUSED,
             #[cfg(all(target_arch = "wasm32", not(feature = "webgl")))]
-            data: Box::new(()),
+            data: Box::new(surface.1),
             config: Mutex::new(None),
         })
     }
@@ -1684,7 +1743,7 @@ impl Instance {
         target_os = "emscripten",
         feature = "webgl"
     ))]
-    pub fn generate_report(&self) -> wgc::hub::GlobalReport {
+    pub fn generate_report(&self) -> wgc::global::GlobalReport {
         self.context
             .as_any()
             .downcast_ref::<crate::backend::Context>()
@@ -1759,7 +1818,7 @@ impl Adapter {
         target_os = "emscripten",
         feature = "webgl"
     ))]
-    pub unsafe fn create_device_from_hal<A: wgc::hub::HalApi>(
+    pub unsafe fn create_device_from_hal<A: wgc::hal_api::HalApi>(
         &self,
         hal_device: hal::OpenDevice<A>,
         desc: &DeviceDescriptor,
@@ -1783,7 +1842,7 @@ impl Adapter {
                 Queue {
                     context,
                     id: queue.id().into(),
-                    data: Box::new(()),
+                    data: Box::new(queue),
                 },
             )
         })
@@ -1813,7 +1872,7 @@ impl Adapter {
         target_os = "emscripten",
         feature = "webgl"
     ))]
-    pub unsafe fn as_hal<A: wgc::hub::HalApi, F: FnOnce(Option<&A::Adapter>) -> R, R>(
+    pub unsafe fn as_hal<A: wgc::hal_api::HalApi, F: FnOnce(Option<&A::Adapter>) -> R, R>(
         &self,
         hal_adapter_callback: F,
     ) -> R {
@@ -2162,7 +2221,7 @@ impl Device {
         target_os = "emscripten",
         feature = "webgl"
     ))]
-    pub unsafe fn create_texture_from_hal<A: wgc::hub::HalApi>(
+    pub unsafe fn create_texture_from_hal<A: wgc::hal_api::HalApi>(
         &self,
         hal_texture: A::Texture,
         desc: &TextureDescriptor,
@@ -2267,7 +2326,7 @@ impl Device {
         target_os = "emscripten",
         feature = "webgl"
     ))]
-    pub unsafe fn as_hal<A: wgc::hub::HalApi, F: FnOnce(Option<&A::Device>) -> R, R>(
+    pub unsafe fn as_hal<A: wgc::hal_api::HalApi, F: FnOnce(Option<&A::Device>) -> R, R>(
         &self,
         hal_device_callback: F,
     ) -> R {
@@ -2609,7 +2668,7 @@ impl Texture {
         target_os = "emscripten",
         feature = "webgl"
     ))]
-    pub unsafe fn as_hal<A: wgc::hub::HalApi, F: FnOnce(Option<&A::Texture>)>(
+    pub unsafe fn as_hal<A: wgc::hal_api::HalApi, F: FnOnce(Option<&A::Texture>)>(
         &self,
         hal_texture_callback: F,
     ) {
@@ -2740,7 +2799,7 @@ impl CommandEncoder {
         CommandBuffer {
             context: Arc::clone(&self.context),
             id: Some(id),
-            data,
+            data: Some(data),
         }
     }
 
@@ -3224,7 +3283,11 @@ impl<'a> RenderPass<'a> {
             &*self.parent.context,
             &mut self.id,
             self.data.as_mut(),
-            Box::new(render_bundles.into_iter().map(|rb| &rb.id)),
+            Box::new(
+                render_bundles
+                    .into_iter()
+                    .map(|rb| (&rb.id, rb.data.as_ref())),
+            ),
         )
     }
 }
@@ -3288,7 +3351,7 @@ impl<'a> RenderPass<'a> {
     /// Dispatches multiple draw calls from the active vertex buffer(s) based on the contents of the `indirect_buffer`.
     /// The count buffer is read to determine how many draws to issue.
     ///
-    /// The indirect buffer must be long enough to account for `max_count` draws, however only `count` will
+    /// The indirect buffer must be long enough to account for `max_count` draws, however only `count`
     /// draws will be read. If `count` is greater than `max_count`, `max_count` will be used.
     ///
     /// The active vertex buffers can be set with [`RenderPass::set_vertex_buffer`].
@@ -3330,7 +3393,7 @@ impl<'a> RenderPass<'a> {
     /// Dispatches multiple draw calls from the active index buffer and the active vertex buffers,
     /// based on the contents of the `indirect_buffer`. The count buffer is read to determine how many draws to issue.
     ///
-    /// The indirect buffer must be long enough to account for `max_count` draws, however only `count` will
+    /// The indirect buffer must be long enough to account for `max_count` draws, however only `count`
     /// draws will be read. If `count` is greater than `max_count`, `max_count` will be used.
     ///
     /// The active index buffer can be set with [`RenderPass::set_index_buffer`], while the active
@@ -3426,7 +3489,7 @@ impl<'a> RenderPass<'a> {
     }
 }
 
-/// [`Features::WRITE_TIMESTAMP_INSIDE_PASSES`] must be enabled on the device in order to call these functions.
+/// [`Features::TIMESTAMP_QUERY_INSIDE_PASSES`] must be enabled on the device in order to call these functions.
 impl<'a> RenderPass<'a> {
     /// Issue a timestamp command at this point in the queue. The
     /// timestamp will be written to the specified query set, at the specified index.
@@ -3605,7 +3668,7 @@ impl<'a> ComputePass<'a> {
     }
 }
 
-/// [`Features::WRITE_TIMESTAMP_INSIDE_PASSES`] must be enabled on the device in order to call these functions.
+/// [`Features::TIMESTAMP_QUERY_INSIDE_PASSES`] must be enabled on the device in order to call these functions.
 impl<'a> ComputePass<'a> {
     /// Issue a timestamp command at this point in the queue. The timestamp will be written to the specified query set, at the specified index.
     ///
@@ -4034,7 +4097,7 @@ impl Queue {
             Box::new(
                 command_buffers
                     .into_iter()
-                    .map(|mut comb| comb.id.take().unwrap()),
+                    .map(|mut comb| (comb.id.take().unwrap(), comb.data.take().unwrap())),
             ),
         );
 
@@ -4044,6 +4107,10 @@ impl Queue {
     /// Gets the amount of nanoseconds each tick of a timestamp query represents.
     ///
     /// Returns zero if timestamp queries are unsupported.
+    ///
+    /// TODO: `<https://github.com/gfx-rs/wgpu/issues/3741>`
+    /// Timestamp values are supposed to represent nanosecond values, see `<https://gpuweb.github.io/gpuweb/#timestamp>`
+    /// Therefore, this is always 1.0 on the web, but on wgpu-core a manual conversion is required currently.
     pub fn get_timestamp_period(&self) -> f32 {
         DynContext::queue_get_timestamp_period(&*self.context, &self.id, self.data.as_ref())
     }
@@ -4222,7 +4289,11 @@ impl Surface {
         target_os = "emscripten",
         feature = "webgl"
     ))]
-    pub unsafe fn as_hal_mut<A: wgc::hub::HalApi, F: FnOnce(Option<&mut A::Surface>) -> R, R>(
+    pub unsafe fn as_hal_mut<
+        A: wgc::hal_api::HalApi,
+        F: FnOnce(Option<&mut A::Surface>) -> R,
+        R,
+    >(
         &mut self,
         hal_surface_callback: F,
     ) -> R {
@@ -4243,18 +4314,61 @@ impl Surface {
 #[cfg(feature = "expose-ids")]
 #[cfg_attr(docsrs, doc(cfg(feature = "expose-ids")))]
 #[repr(transparent)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub struct Id(core::num::NonZeroU64);
+pub struct Id<T>(core::num::NonZeroU64, std::marker::PhantomData<*mut T>);
+
+// SAFETY: `Id` is a bare `NonZeroU64`, the type parameter is a marker purely to avoid confusing Ids
+// returned for different types , so `Id` can safely implement Send and Sync.
+#[cfg(feature = "expose-ids")]
+unsafe impl<T> Send for Id<T> {}
+
+// SAFETY: See the implementation for `Send`.
+#[cfg(feature = "expose-ids")]
+unsafe impl<T> Sync for Id<T> {}
+
+#[cfg(feature = "expose-ids")]
+impl<T> Clone for Id<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+#[cfg(feature = "expose-ids")]
+impl<T> Copy for Id<T> {}
+
+#[cfg(feature = "expose-ids")]
+impl<T> Debug for Id<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_tuple("Id").field(&self.0).finish()
+    }
+}
+
+#[cfg(feature = "expose-ids")]
+impl<T> PartialEq for Id<T> {
+    fn eq(&self, other: &Id<T>) -> bool {
+        self.0 == other.0
+    }
+}
+
+#[cfg(feature = "expose-ids")]
+impl<T> Eq for Id<T> {}
+
+#[cfg(feature = "expose-ids")]
+impl<T> std::hash::Hash for Id<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state)
+    }
+}
 
 #[cfg(feature = "expose-ids")]
 impl Adapter {
     /// Returns a globally-unique identifier for this `Adapter`.
     ///
     /// Calling this method multiple times on the same object will always return the same value.
-    /// The returned value is guaranteed to be different for all resources created from the same `Instance`.
+    /// The returned value is guaranteed to be unique among all `Adapter`s created from the same
+    /// `Instance`.
     #[cfg_attr(docsrs, doc(cfg(feature = "expose-ids")))]
-    pub fn global_id(&self) -> Id {
-        self.id.global_id()
+    pub fn global_id(&self) -> Id<Adapter> {
+        Id(self.id.global_id(), std::marker::PhantomData)
     }
 }
 
@@ -4263,10 +4377,11 @@ impl Device {
     /// Returns a globally-unique identifier for this `Device`.
     ///
     /// Calling this method multiple times on the same object will always return the same value.
-    /// The returned value is guaranteed to be different for all resources created from the same `Instance`.
+    /// The returned value is guaranteed to be unique among all `Device`s created from the same
+    /// `Instance`.
     #[cfg_attr(docsrs, doc(cfg(feature = "expose-ids")))]
-    pub fn global_id(&self) -> Id {
-        self.id.global_id()
+    pub fn global_id(&self) -> Id<Device> {
+        Id(self.id.global_id(), std::marker::PhantomData)
     }
 }
 
@@ -4275,10 +4390,11 @@ impl Queue {
     /// Returns a globally-unique identifier for this `Queue`.
     ///
     /// Calling this method multiple times on the same object will always return the same value.
-    /// The returned value is guaranteed to be different for all resources created from the same `Instance`.
+    /// The returned value is guaranteed to be unique among all `Queue`s created from the same
+    /// `Instance`.
     #[cfg_attr(docsrs, doc(cfg(feature = "expose-ids")))]
-    pub fn global_id(&self) -> Id {
-        self.id.global_id()
+    pub fn global_id(&self) -> Id<Queue> {
+        Id(self.id.global_id(), std::marker::PhantomData)
     }
 }
 
@@ -4287,10 +4403,11 @@ impl ShaderModule {
     /// Returns a globally-unique identifier for this `ShaderModule`.
     ///
     /// Calling this method multiple times on the same object will always return the same value.
-    /// The returned value is guaranteed to be different for all resources created from the same `Instance`.
+    /// The returned value is guaranteed to be unique among all `ShaderModule`s created from the same
+    /// `Instance`.
     #[cfg_attr(docsrs, doc(cfg(feature = "expose-ids")))]
-    pub fn global_id(&self) -> Id {
-        self.id.global_id()
+    pub fn global_id(&self) -> Id<ShaderModule> {
+        Id(self.id.global_id(), std::marker::PhantomData)
     }
 }
 
@@ -4299,10 +4416,11 @@ impl BindGroupLayout {
     /// Returns a globally-unique identifier for this `BindGroupLayout`.
     ///
     /// Calling this method multiple times on the same object will always return the same value.
-    /// The returned value is guaranteed to be different for all resources created from the same `Instance`.
+    /// The returned value is guaranteed to be unique among all `BindGroupLayout`s created from the same
+    /// `Instance`.
     #[cfg_attr(docsrs, doc(cfg(feature = "expose-ids")))]
-    pub fn global_id(&self) -> Id {
-        self.id.global_id()
+    pub fn global_id(&self) -> Id<BindGroupLayout> {
+        Id(self.id.global_id(), std::marker::PhantomData)
     }
 }
 
@@ -4311,10 +4429,11 @@ impl BindGroup {
     /// Returns a globally-unique identifier for this `BindGroup`.
     ///
     /// Calling this method multiple times on the same object will always return the same value.
-    /// The returned value is guaranteed to be different for all resources created from the same `Instance`.
+    /// The returned value is guaranteed to be unique among all `BindGroup`s created from the same
+    /// `Instance`.
     #[cfg_attr(docsrs, doc(cfg(feature = "expose-ids")))]
-    pub fn global_id(&self) -> Id {
-        self.id.global_id()
+    pub fn global_id(&self) -> Id<BindGroup> {
+        Id(self.id.global_id(), std::marker::PhantomData)
     }
 }
 
@@ -4323,10 +4442,11 @@ impl TextureView {
     /// Returns a globally-unique identifier for this `TextureView`.
     ///
     /// Calling this method multiple times on the same object will always return the same value.
-    /// The returned value is guaranteed to be different for all resources created from the same `Instance`.
+    /// The returned value is guaranteed to be unique among all `TextureView`s created from the same
+    /// `Instance`.
     #[cfg_attr(docsrs, doc(cfg(feature = "expose-ids")))]
-    pub fn global_id(&self) -> Id {
-        self.id.global_id()
+    pub fn global_id(&self) -> Id<TextureView> {
+        Id(self.id.global_id(), std::marker::PhantomData)
     }
 }
 
@@ -4335,10 +4455,11 @@ impl Sampler {
     /// Returns a globally-unique identifier for this `Sampler`.
     ///
     /// Calling this method multiple times on the same object will always return the same value.
-    /// The returned value is guaranteed to be different for all resources created from the same `Instance`.
+    /// The returned value is guaranteed to be unique among all `Sampler`s created from the same
+    /// `Instance`.
     #[cfg_attr(docsrs, doc(cfg(feature = "expose-ids")))]
-    pub fn global_id(&self) -> Id {
-        self.id.global_id()
+    pub fn global_id(&self) -> Id<Sampler> {
+        Id(self.id.global_id(), std::marker::PhantomData)
     }
 }
 
@@ -4347,10 +4468,11 @@ impl Buffer {
     /// Returns a globally-unique identifier for this `Buffer`.
     ///
     /// Calling this method multiple times on the same object will always return the same value.
-    /// The returned value is guaranteed to be different for all resources created from the same `Instance`.
+    /// The returned value is guaranteed to be unique among all `Buffer`s created from the same
+    /// `Instance`.
     #[cfg_attr(docsrs, doc(cfg(feature = "expose-ids")))]
-    pub fn global_id(&self) -> Id {
-        self.id.global_id()
+    pub fn global_id(&self) -> Id<Buffer> {
+        Id(self.id.global_id(), std::marker::PhantomData)
     }
 }
 
@@ -4359,10 +4481,11 @@ impl Texture {
     /// Returns a globally-unique identifier for this `Texture`.
     ///
     /// Calling this method multiple times on the same object will always return the same value.
-    /// The returned value is guaranteed to be different for all resources created from the same `Instance`.
+    /// The returned value is guaranteed to be unique among all `Texture`s created from the same
+    /// `Instance`.
     #[cfg_attr(docsrs, doc(cfg(feature = "expose-ids")))]
-    pub fn global_id(&self) -> Id {
-        self.id.global_id()
+    pub fn global_id(&self) -> Id<Texture> {
+        Id(self.id.global_id(), std::marker::PhantomData)
     }
 }
 
@@ -4371,10 +4494,11 @@ impl QuerySet {
     /// Returns a globally-unique identifier for this `QuerySet`.
     ///
     /// Calling this method multiple times on the same object will always return the same value.
-    /// The returned value is guaranteed to be different for all resources created from the same `Instance`.
+    /// The returned value is guaranteed to be unique among all `QuerySet`s created from the same
+    /// `Instance`.
     #[cfg_attr(docsrs, doc(cfg(feature = "expose-ids")))]
-    pub fn global_id(&self) -> Id {
-        self.id.global_id()
+    pub fn global_id(&self) -> Id<QuerySet> {
+        Id(self.id.global_id(), std::marker::PhantomData)
     }
 }
 
@@ -4383,10 +4507,11 @@ impl PipelineLayout {
     /// Returns a globally-unique identifier for this `PipelineLayout`.
     ///
     /// Calling this method multiple times on the same object will always return the same value.
-    /// The returned value is guaranteed to be different for all resources created from the same `Instance`.
+    /// The returned value is guaranteed to be unique among all `PipelineLayout`s created from the same
+    /// `Instance`.
     #[cfg_attr(docsrs, doc(cfg(feature = "expose-ids")))]
-    pub fn global_id(&self) -> Id {
-        self.id.global_id()
+    pub fn global_id(&self) -> Id<PipelineLayout> {
+        Id(self.id.global_id(), std::marker::PhantomData)
     }
 }
 
@@ -4395,10 +4520,11 @@ impl RenderPipeline {
     /// Returns a globally-unique identifier for this `RenderPipeline`.
     ///
     /// Calling this method multiple times on the same object will always return the same value.
-    /// The returned value is guaranteed to be different for all resources created from the same `Instance`.
+    /// The returned value is guaranteed to be unique among all `RenderPipeline`s created from the same
+    /// `Instance`.
     #[cfg_attr(docsrs, doc(cfg(feature = "expose-ids")))]
-    pub fn global_id(&self) -> Id {
-        self.id.global_id()
+    pub fn global_id(&self) -> Id<RenderPipeline> {
+        Id(self.id.global_id(), std::marker::PhantomData)
     }
 }
 
@@ -4407,10 +4533,11 @@ impl ComputePipeline {
     /// Returns a globally-unique identifier for this `ComputePipeline`.
     ///
     /// Calling this method multiple times on the same object will always return the same value.
-    /// The returned value is guaranteed to be different for all resources created from the same `Instance`.
+    /// The returned value is guaranteed to be unique among all `ComputePipeline`s created from the same
+    /// `Instance`.
     #[cfg_attr(docsrs, doc(cfg(feature = "expose-ids")))]
-    pub fn global_id(&self) -> Id {
-        self.id.global_id()
+    pub fn global_id(&self) -> Id<ComputePipeline> {
+        Id(self.id.global_id(), std::marker::PhantomData)
     }
 }
 
@@ -4419,10 +4546,11 @@ impl RenderBundle {
     /// Returns a globally-unique identifier for this `RenderBundle`.
     ///
     /// Calling this method multiple times on the same object will always return the same value.
-    /// The returned value is guaranteed to be different for all resources created from the same `Instance`.
+    /// The returned value is guaranteed to be unique among all `RenderBundle`s created from the same
+    /// `Instance`.
     #[cfg_attr(docsrs, doc(cfg(feature = "expose-ids")))]
-    pub fn global_id(&self) -> Id {
-        self.id.global_id()
+    pub fn global_id(&self) -> Id<RenderBundle> {
+        Id(self.id.global_id(), std::marker::PhantomData)
     }
 }
 
@@ -4431,10 +4559,11 @@ impl Surface {
     /// Returns a globally-unique identifier for this `Surface`.
     ///
     /// Calling this method multiple times on the same object will always return the same value.
-    /// The returned value is guaranteed to be different for all resources created from the same `Instance`.
+    /// The returned value is guaranteed to be unique among all `Surface`s created from the same
+    /// `Instance`.
     #[cfg_attr(docsrs, doc(cfg(feature = "expose-ids")))]
-    pub fn global_id(&self) -> Id {
-        self.id.global_id()
+    pub fn global_id(&self) -> Id<Surface> {
+        Id(self.id.global_id(), std::marker::PhantomData)
     }
 }
 

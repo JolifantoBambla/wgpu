@@ -1,10 +1,11 @@
 #[cfg(not(target_arch = "wasm32"))]
 mod inner {
     use std::{
-        mem::size_of,
         process::{exit, Command},
         time::Instant,
     };
+
+    use bitflags::Flags;
 
     // Lets keep these on one line
     #[rustfmt::skip]
@@ -68,7 +69,7 @@ mod inner {
         wgpu::TextureFormat::Bc5RgUnorm,
         wgpu::TextureFormat::Bc5RgSnorm,
         wgpu::TextureFormat::Bc6hRgbUfloat,
-        wgpu::TextureFormat::Bc6hRgbSfloat,
+        wgpu::TextureFormat::Bc6hRgbFloat,
         wgpu::TextureFormat::Bc7RgbaUnorm,
         wgpu::TextureFormat::Bc7RgbaUnormSrgb,
         wgpu::TextureFormat::Etc2Rgb8Unorm,
@@ -133,6 +134,10 @@ mod inner {
         let features = adapter.features();
         let limits = adapter.limits();
 
+        //////////////////
+        // Adapter Info //
+        //////////////////
+
         println!("Adapter {idx}:");
         println!("\t   Backend: {:?}", info.backend);
         println!("\t      Name: {:?}", info.name);
@@ -142,15 +147,20 @@ mod inner {
         println!("\t    Driver: {:?}", info.driver);
         println!("\tDriverInfo: {:?}", info.driver_info);
         println!("\t Compliant: {:?}", downlevel.is_webgpu_compliant());
+
+        //////////////
+        // Features //
+        //////////////
+
         println!("\tFeatures:");
-        for i in 0..(size_of::<wgpu::Features>() * 8) {
-            let bit = wgpu::Features::from_bits(1 << i as u64);
-            if let Some(bit) = bit {
-                if wgpu::Features::all().contains(bit) {
-                    println!("\t\t{:>63} {}", format!("{bit:?}:"), features.contains(bit));
-                }
-            }
+        let max_feature_flag_width = wgpu::Features::max_debug_print_width();
+        for bit in wgpu::Features::all().iter() {
+            println!("\t\t{:>width$}: {}", bit.name(), features.contains(bit), width = max_feature_flag_width);
         }
+
+        ////////////
+        // Limits //
+        ////////////
 
         println!("\tLimits:");
         let wgpu::Limits {
@@ -214,6 +224,10 @@ mod inner {
         println!("\t\t                    Max Compute Workgroup Size Z: {max_compute_workgroup_size_z}");
         println!("\t\t            Max Compute Workgroups Per Dimension: {max_compute_workgroups_per_dimension}");
 
+        //////////////////////////
+        // Downlevel Properties //
+        //////////////////////////
+
         println!("\tDownlevel Properties:");
         let wgpu::DownlevelCapabilities {
             shader_model,
@@ -221,60 +235,69 @@ mod inner {
             flags,
         } = downlevel;
         println!("\t\t                       Shader Model: {shader_model:?}");
-        for i in 0..(size_of::<wgpu::DownlevelFlags>() * 8) {
-            let bit = wgpu::DownlevelFlags::from_bits(1 << i as u64);
-            if let Some(bit) = bit {
-                if wgpu::DownlevelFlags::all().contains(bit) {
-                    println!("\t\t{:>37} {}", format!("{bit:?}:"), flags.contains(bit));
-                }
-            }
-        }
+        let max_downlevel_flag_width = wgpu::DownlevelFlags::max_debug_print_width();
+        for bit in wgpu::DownlevelFlags::all().iter() {
+            println!("\t\t{:>width$}: {}", bit.name(), flags.contains(bit), width = max_downlevel_flag_width);
+        };
 
-        println!("\tTexture Format Features:      ┌──────────┬──────────┬──────────Allowed┬Usages───────────┬───────────────────┐ ┌────────────┬────────────────┬────────────────┬─────────Feature┬Flags────────────────┬────────────────────┬─────────────────┬───────────┐");
+        ////////////////////
+        // Texture Usages //
+        ////////////////////
+
+        let max_format_name_size = max_texture_format_name_size();
+        let texture_format_whitespace = " ".repeat(max_format_name_size);
+
+        println!("\n\t Texture Format Allowed Usages:");
+
+        print!("\t\t {texture_format_whitespace}");
+        wgpu::TextureUsages::println_table_header();
         for format in TEXTURE_FORMAT_LIST {
             let features = adapter.get_texture_format_features(format);
-            let format_name = match format {
-                wgpu::TextureFormat::Astc { block, channel } => {
-                    format!("Astc{block:?}{channel:?}:")
+            let format_name = texture_format_name(format);
+            print!("\t\t{format_name:>0$}", max_format_name_size);
+            for bit in wgpu::TextureUsages::all().iter() {
+                print!(" │ ");
+                if features.allowed_usages.contains(bit) {
+                    print!("{}", bit.name());
                 }
-                _ => {
-                    format!("{format:?}:")
+                else {
+                    let length = bit.name().len();
+                    print!("{}", " ".repeat(length))
                 }
             };
-            print!("\t\t{format_name:>21}");
-            for i in 0..(size_of::<wgpu::TextureUsages>() * 8) {
-                let bit = wgpu::TextureUsages::from_bits(1 << i as u32);
-                if let Some(bit) = bit {
-                    print!(" │ ");
-                    if features.allowed_usages.contains(bit) {
-                        print!("{bit:?}");
-                    }
-                    else {
-                        let length = format!("{bit:?}").len();
-                        print!("{}", " ".repeat(length))
-                    }
-                }
-            }
-            print!(" │ │ ");
-            for i in 0..(size_of::<wgpu::TextureFormatFeatureFlags>() * 8) {
-                let bit = wgpu::TextureFormatFeatureFlags::from_bits(1 << i as u32);
-                if let Some(bit) = bit {
-                    if i != 0 {
-                        print!(" │ ")
-                    }
-                    if features.flags.contains(bit) {
-                        print!("{bit:?}");
-                    }
-                    else {
-                        let length = format!("{bit:?}").len();
-                        print!("{}", " ".repeat(length))
-                    }
-                }
-            }
-
             println!(" │");
         }
-        println!("\t                              └──────────┴──────────┴─────────────────┴─────────────────┴───────────────────┘ └────────────┴────────────────┴────────────────┴────────────────┴─────────────────────┴────────────────────┴─────────────────┴───────────┘");
+        print!("\t\t {texture_format_whitespace}");
+        wgpu::TextureUsages::println_table_footer();
+
+        //////////////////////////
+        // Texture Format Flags //
+        //////////////////////////
+
+        println!("\n\t Texture Format Flags:");
+
+        print!("\t\t {texture_format_whitespace}");
+        wgpu::TextureFormatFeatureFlags::println_table_header();
+
+        for format in TEXTURE_FORMAT_LIST {
+            let features = adapter.get_texture_format_features(format);
+            let format_name = texture_format_name(format);
+
+            print!("\t\t{format_name:>0$}", max_format_name_size);
+            for bit in wgpu::TextureFormatFeatureFlags::all().iter() {
+                print!(" │ ");
+                if features.flags.contains(bit) {
+                    print!("{}", bit.name());
+                }
+                else {
+                    let length = bit.name().len();
+                    print!("{}", " ".repeat(length))
+                }
+            };
+            println!(" │");
+        }
+        print!("\t\t {texture_format_whitespace}");
+        wgpu::TextureFormatFeatureFlags::println_table_footer();
     }
 
     pub fn main() {
@@ -339,6 +362,69 @@ mod inner {
             let all_time = all_start.elapsed().as_secs_f32();
 
             println!("=========== {adapter_count} adapters PASSED in {all_time:.3}s ===========");
+        }
+    }
+
+    trait FlagsExt: Flags {
+        fn name(&self) -> &'static str {
+            self.iter_names().next().unwrap().0
+        }
+
+        fn valid_bits() -> std::iter::Enumerate<bitflags::iter::Iter<Self>> {
+            Self::all().iter().enumerate()
+        }
+
+        fn max_debug_print_width() -> usize {
+            let mut width = 0;
+            for bit in Self::all().iter() {
+                width = width.max(bit.name().len());
+            }
+            width
+        }
+
+        fn println_table_header() {
+            print!("┌─");
+            for (i, bit) in Self::valid_bits() {
+                if i != 0 {
+                    print!("─┬─");
+                }
+                let length = bit.name().len();
+                print!("{}", "─".repeat(length));
+            }
+            println!("─┐");
+        }
+
+        fn println_table_footer() {
+            print!("└─");
+            for (i, bit) in Self::valid_bits() {
+                if i != 0 {
+                    print!("─┴─");
+                }
+                let length = bit.name().len();
+                print!("{}", "─".repeat(length));
+            }
+            println!("─┘")
+        }
+    }
+
+    impl<T> FlagsExt for T where T: Flags {}
+
+    fn max_texture_format_name_size() -> usize {
+        TEXTURE_FORMAT_LIST
+            .into_iter()
+            .map(|f| texture_format_name(f).len())
+            .max()
+            .unwrap()
+    }
+
+    fn texture_format_name(format: wgpu::TextureFormat) -> String {
+        match format {
+            wgpu::TextureFormat::Astc { block, channel } => {
+                format!("Astc{block:?}{channel:?}:")
+            }
+            _ => {
+                format!("{format:?}:")
+            }
         }
     }
 }

@@ -1,5 +1,5 @@
 use super::{conv, AsNative};
-use std::{mem, ops::Range};
+use std::{borrow::Cow, mem, ops::Range};
 
 // has to match `Temp::binding_sizes`
 const WORD_SIZE: usize = 4;
@@ -10,9 +10,9 @@ impl Default for super::CommandState {
             blit: None,
             render: None,
             compute: None,
-            raw_primitive_type: mtl::MTLPrimitiveType::Point,
+            raw_primitive_type: metal::MTLPrimitiveType::Point,
             index: None,
-            raw_wg_size: mtl::MTLSize::new(0, 0, 0),
+            raw_wg_size: metal::MTLSize::new(0, 0, 0),
             stage_infos: Default::default(),
             storage_buffer_length_map: Default::default(),
             work_group_memory_sizes: Vec::new(),
@@ -22,7 +22,7 @@ impl Default for super::CommandState {
 }
 
 impl super::CommandEncoder {
-    fn enter_blit(&mut self) -> &mtl::BlitCommandEncoderRef {
+    fn enter_blit(&mut self) -> &metal::BlitCommandEncoderRef {
         if self.state.blit.is_none() {
             debug_assert!(self.state.render.is_none() && self.state.compute.is_none());
             objc::rc::autoreleasepool(|| {
@@ -39,7 +39,7 @@ impl super::CommandEncoder {
         }
     }
 
-    fn enter_any(&mut self) -> Option<&mtl::CommandEncoderRef> {
+    fn enter_any(&mut self) -> Option<&metal::CommandEncoderRef> {
         if let Some(ref encoder) = self.state.render {
             Some(encoder)
         } else if let Some(ref encoder) = self.state.compute {
@@ -127,8 +127,8 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
 
     unsafe fn end_encoding(&mut self) -> Result<super::CommandBuffer, crate::DeviceError> {
         self.leave_blit();
-        assert!(self.state.render.is_none());
-        assert!(self.state.compute.is_none());
+        debug_assert!(self.state.render.is_none());
+        debug_assert!(self.state.compute.is_none());
         Ok(super::CommandBuffer {
             raw: self.raw_cmd_buf.take().unwrap(),
         })
@@ -187,6 +187,14 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
     ) where
         T: Iterator<Item = crate::TextureCopy>,
     {
+        let dst_texture = if src.format != dst.format {
+            let raw_format = self.shared.private_caps.map_format(src.format);
+            Cow::Owned(objc::rc::autoreleasepool(|| {
+                dst.raw.new_texture_view(raw_format)
+            }))
+        } else {
+            Cow::Borrowed(&dst.raw)
+        };
         let encoder = self.enter_blit();
         for copy in regions {
             let src_origin = conv::map_origin(&copy.src_base.origin);
@@ -199,7 +207,7 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
                 copy.src_base.mip_level as u64,
                 src_origin,
                 extent,
-                &dst.raw,
+                &dst_texture,
                 copy.dst_base.array_layer as u64,
                 copy.dst_base.mip_level as u64,
                 dst_origin,
@@ -223,14 +231,11 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
                 .texture_base
                 .max_copy_size(&dst.copy_size)
                 .min(&copy.size);
-            let bytes_per_row = copy
-                .buffer_layout
-                .bytes_per_row
-                .map_or(0, |v| v.get() as u64);
+            let bytes_per_row = copy.buffer_layout.bytes_per_row.unwrap_or(0) as u64;
             let image_byte_stride = if extent.depth > 1 {
                 copy.buffer_layout
                     .rows_per_image
-                    .map_or(0, |v| v.get() as u64 * bytes_per_row)
+                    .map_or(0, |v| v as u64 * bytes_per_row)
             } else {
                 // Don't pass a stride when updating a single layer, otherwise metal validation
                 // fails when updating a subset of the image due to the stride being larger than
@@ -269,14 +274,11 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
                 .texture_base
                 .max_copy_size(&src.copy_size)
                 .min(&copy.size);
-            let bytes_per_row = copy
-                .buffer_layout
-                .bytes_per_row
-                .map_or(0, |v| v.get() as u64);
+            let bytes_per_row = copy.buffer_layout.bytes_per_row.unwrap_or(0) as u64;
             let bytes_per_image = copy
                 .buffer_layout
                 .rows_per_image
-                .map_or(0, |v| v.get() as u64 * bytes_per_row);
+                .map_or(0, |v| v as u64 * bytes_per_row);
             encoder.copy_from_texture_to_buffer(
                 &src.raw,
                 copy.texture_base.array_layer as u64,
@@ -300,7 +302,7 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
                     .as_ref()
                     .unwrap()
                     .set_visibility_result_mode(
-                        mtl::MTLVisibilityResultMode::Boolean,
+                        metal::MTLVisibilityResultMode::Boolean,
                         index as u64 * crate::QUERY_SIZE,
                     );
             }
@@ -314,15 +316,24 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
                     .render
                     .as_ref()
                     .unwrap()
-                    .set_visibility_result_mode(mtl::MTLVisibilityResultMode::Disabled, 0);
+                    .set_visibility_result_mode(metal::MTLVisibilityResultMode::Disabled, 0);
             }
             _ => {}
         }
     }
-    unsafe fn write_timestamp(&mut self, _set: &super::QuerySet, _index: u32) {}
+    unsafe fn write_timestamp(&mut self, _set: &super::QuerySet, _index: u32) {
+        // TODO: If MTLCounterSamplingPoint::AtDrawBoundary/AtBlitBoundary/AtDispatchBoundary is supported,
+        //       we don't need to insert a new encoder, but can instead use respective current one.
+        //let encoder = self.enter_any().unwrap_or_else(|| self.enter_blit());
+
+        // TODO: Otherwise, we need to create a new blit command encoder with a descriptor that inserts the timestamps.
+        // Note that as of writing creating a new encoder is not exposed by the metal crate.
+        // https://developer.apple.com/documentation/metal/mtlcommandbuffer/3564431-makeblitcommandencoder
+    }
+
     unsafe fn reset_queries(&mut self, set: &super::QuerySet, range: Range<u32>) {
         let encoder = self.enter_blit();
-        let raw_range = mtl::NSRange {
+        let raw_range = metal::NSRange {
             location: range.start as u64 * crate::QUERY_SIZE,
             length: (range.end - range.start) as u64 * crate::QUERY_SIZE,
         };
@@ -337,14 +348,27 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
         _: wgt::BufferSize, // Metal doesn't support queries that are bigger than a single element are not supported
     ) {
         let encoder = self.enter_blit();
-        let size = (range.end - range.start) as u64 * crate::QUERY_SIZE;
-        encoder.copy_from_buffer(
-            &set.raw_buffer,
-            range.start as u64 * crate::QUERY_SIZE,
-            &buffer.raw,
-            offset,
-            size,
-        );
+        match set.ty {
+            wgt::QueryType::Occlusion => {
+                let size = (range.end - range.start) as u64 * crate::QUERY_SIZE;
+                encoder.copy_from_buffer(
+                    &set.raw_buffer,
+                    range.start as u64 * crate::QUERY_SIZE,
+                    &buffer.raw,
+                    offset,
+                    size,
+                );
+            }
+            wgt::QueryType::Timestamp => {
+                encoder.resolve_counters(
+                    set.counter_sample_buffer.as_ref().unwrap(),
+                    metal::NSRange::new(range.start as u64, range.end as u64),
+                    &buffer.raw,
+                    offset,
+                );
+            }
+            wgt::QueryType::PipelineStatistics(_) => todo!(),
+        }
     }
 
     // render
@@ -353,8 +377,12 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
         self.begin_pass();
         self.state.index = None;
 
+        assert!(self.state.blit.is_none());
+        assert!(self.state.compute.is_none());
+        assert!(self.state.render.is_none());
+
         objc::rc::autoreleasepool(|| {
-            let descriptor = mtl::RenderPassDescriptor::new();
+            let descriptor = metal::RenderPassDescriptor::new();
             //TODO: set visibility results buffer
 
             for (i, at) in desc.color_attachments.iter().enumerate() {
@@ -366,10 +394,10 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
                         at_descriptor.set_resolve_texture(Some(&resolve.view.raw));
                     }
                     let load_action = if at.ops.contains(crate::AttachmentOps::LOAD) {
-                        mtl::MTLLoadAction::Load
+                        metal::MTLLoadAction::Load
                     } else {
                         at_descriptor.set_clear_color(conv::map_clear_color(&at.clear_value));
-                        mtl::MTLLoadAction::Clear
+                        metal::MTLLoadAction::Clear
                     };
                     let store_action = conv::map_store_action(
                         at.ops.contains(crate::AttachmentOps::STORE),
@@ -386,15 +414,15 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
                     at_descriptor.set_texture(Some(&at.target.view.raw));
 
                     let load_action = if at.depth_ops.contains(crate::AttachmentOps::LOAD) {
-                        mtl::MTLLoadAction::Load
+                        metal::MTLLoadAction::Load
                     } else {
                         at_descriptor.set_clear_depth(at.clear_value.0 as f64);
-                        mtl::MTLLoadAction::Clear
+                        metal::MTLLoadAction::Clear
                     };
                     let store_action = if at.depth_ops.contains(crate::AttachmentOps::STORE) {
-                        mtl::MTLStoreAction::Store
+                        metal::MTLStoreAction::Store
                     } else {
-                        mtl::MTLStoreAction::DontCare
+                        metal::MTLStoreAction::DontCare
                     };
                     at_descriptor.set_load_action(load_action);
                     at_descriptor.set_store_action(store_action);
@@ -409,18 +437,39 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
                     at_descriptor.set_texture(Some(&at.target.view.raw));
 
                     let load_action = if at.stencil_ops.contains(crate::AttachmentOps::LOAD) {
-                        mtl::MTLLoadAction::Load
+                        metal::MTLLoadAction::Load
                     } else {
                         at_descriptor.set_clear_stencil(at.clear_value.1);
-                        mtl::MTLLoadAction::Clear
+                        metal::MTLLoadAction::Clear
                     };
                     let store_action = if at.stencil_ops.contains(crate::AttachmentOps::STORE) {
-                        mtl::MTLStoreAction::Store
+                        metal::MTLStoreAction::Store
                     } else {
-                        mtl::MTLStoreAction::DontCare
+                        metal::MTLStoreAction::DontCare
                     };
                     at_descriptor.set_load_action(load_action);
                     at_descriptor.set_store_action(store_action);
+                }
+            }
+
+            if let Some(timestamp_writes) = desc.timestamp_writes.as_ref() {
+                let sba_descriptor = descriptor
+                    .sample_buffer_attachments()
+                    .object_at(0 as _)
+                    .unwrap();
+                sba_descriptor.set_sample_buffer(
+                    timestamp_writes
+                        .query_set
+                        .counter_sample_buffer
+                        .as_ref()
+                        .unwrap(),
+                );
+
+                if let Some(start_index) = timestamp_writes.beginning_of_pass_write_index {
+                    sba_descriptor.set_start_of_vertex_sample_index(start_index as _);
+                }
+                if let Some(end_index) = timestamp_writes.end_of_pass_write_index {
+                    sba_descriptor.set_end_of_fragment_sample_index(end_index as _);
                 }
             }
 
@@ -666,7 +715,10 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
     unsafe fn set_render_pipeline(&mut self, pipeline: &super::RenderPipeline) {
         self.state.raw_primitive_type = pipeline.raw_primitive_type;
         self.state.stage_infos.vs.assign_from(&pipeline.vs_info);
-        self.state.stage_infos.fs.assign_from(&pipeline.fs_info);
+        match pipeline.fs_info {
+            Some(ref info) => self.state.stage_infos.fs.assign_from(info),
+            None => self.state.stage_infos.fs.clear(),
+        }
 
         let encoder = self.state.render.as_ref().unwrap();
         encoder.set_render_pipeline_state(&pipeline.raw);
@@ -713,8 +765,8 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
         format: wgt::IndexFormat,
     ) {
         let (stride, raw_type) = match format {
-            wgt::IndexFormat::Uint16 => (2, mtl::MTLIndexType::UInt16),
-            wgt::IndexFormat::Uint32 => (4, mtl::MTLIndexType::UInt32),
+            wgt::IndexFormat::Uint16 => (2, metal::MTLIndexType::UInt16),
+            wgt::IndexFormat::Uint32 => (4, metal::MTLIndexType::UInt32),
         };
         self.state.index = Some(super::IndexState {
             buffer_ptr: AsNative::from(binding.buffer.raw.as_ref()),
@@ -741,7 +793,7 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
             depth_range.end
         };
         let encoder = self.state.render.as_ref().unwrap();
-        encoder.set_viewport(mtl::MTLViewport {
+        encoder.set_viewport(metal::MTLViewport {
             originX: rect.x as _,
             originY: rect.y as _,
             width: rect.w as _,
@@ -752,7 +804,7 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
     }
     unsafe fn set_scissor_rect(&mut self, rect: &crate::Rect<u32>) {
         //TODO: support empty scissors by modifying the viewport
-        let scissor = mtl::MTLScissorRect {
+        let scissor = metal::MTLScissorRect {
             x: rect.x as _,
             y: rect.y as _,
             width: rect.w as _,
@@ -901,15 +953,44 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
 
     // compute
 
-    unsafe fn begin_compute_pass(&mut self, desc: &crate::ComputePassDescriptor) {
+    unsafe fn begin_compute_pass(&mut self, desc: &crate::ComputePassDescriptor<super::Api>) {
         self.begin_pass();
 
+        debug_assert!(self.state.blit.is_none());
+        debug_assert!(self.state.compute.is_none());
+        debug_assert!(self.state.render.is_none());
+
         let raw = self.raw_cmd_buf.as_ref().unwrap();
+
         objc::rc::autoreleasepool(|| {
-            let encoder = raw.new_compute_command_encoder();
+            let descriptor = metal::ComputePassDescriptor::new();
+
+            if let Some(timestamp_writes) = desc.timestamp_writes.as_ref() {
+                let sba_descriptor = descriptor
+                    .sample_buffer_attachments()
+                    .object_at(0 as _)
+                    .unwrap();
+                sba_descriptor.set_sample_buffer(
+                    timestamp_writes
+                        .query_set
+                        .counter_sample_buffer
+                        .as_ref()
+                        .unwrap(),
+                );
+
+                if let Some(start_index) = timestamp_writes.beginning_of_pass_write_index {
+                    sba_descriptor.set_start_of_encoder_sample_index(start_index as _);
+                }
+                if let Some(end_index) = timestamp_writes.end_of_pass_write_index {
+                    sba_descriptor.set_end_of_encoder_sample_index(end_index as _);
+                }
+            }
+
+            let encoder = raw.compute_command_encoder_with_descriptor(descriptor);
             if let Some(label) = desc.label {
                 encoder.set_label(label);
             }
+
             self.state.compute = Some(encoder.to_owned());
         });
     }
@@ -957,7 +1038,7 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
 
     unsafe fn dispatch(&mut self, count: [u32; 3]) {
         let encoder = self.state.compute.as_ref().unwrap();
-        let raw_count = mtl::MTLSize {
+        let raw_count = metal::MTLSize {
             width: count[0] as u64,
             height: count[1] as u64,
             depth: count[2] as u64,

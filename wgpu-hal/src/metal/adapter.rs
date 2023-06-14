@@ -1,4 +1,4 @@
-use mtl::{MTLFeatureSet, MTLGPUFamily, MTLLanguageVersion, MTLReadWriteTextureTier};
+use metal::{MTLFeatureSet, MTLGPUFamily, MTLLanguageVersion, MTLReadWriteTextureTier};
 use objc::{class, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 use wgt::{AstcBlock, AstcChannel};
@@ -27,6 +27,33 @@ impl crate::Adapter<super::Api> for super::Adapter {
             .device
             .lock()
             .new_command_queue_with_max_command_buffer_count(MAX_COMMAND_BUFFERS);
+
+        // Acquiring the meaning of timestamp ticks is hard with Metal!
+        // The only thing there is is a method correlating cpu & gpu timestamps (`device.sample_timestamps`).
+        // Users are supposed to call this method twice and calculate the difference,
+        // see "Converting GPU Timestamps into CPU Time":
+        // https://developer.apple.com/documentation/metal/gpu_counters_and_counter_sample_buffers/converting_gpu_timestamps_into_cpu_time
+        // Not only does this mean we get an approximate value, this is as also *very slow*!
+        // Chromium opted to solve this using a linear regression that they stop at some point
+        // https://source.chromium.org/chromium/chromium/src/+/refs/heads/main:third_party/dawn/src/dawn/native/metal/DeviceMTL.mm;drc=76be2f9f117654f3fe4faa477b0445114fccedda;bpv=0;bpt=1;l=46
+        // Generally, the assumption is that timestamp values aren't changing over time, after all all other APIs provide stable values.
+        //
+        // We should do as Chromium does for the general case, but this requires quite some state tracking
+        // and doesn't even provide perfectly accurate values, especially at the start of the application when
+        // we didn't have the chance to sample a lot of values just yet.
+        //
+        // So instead, we're doing the dangerous but easy thing and use our "knowledge" of timestamps
+        // conversions on different devices, after all Metal isn't supported on that many ;)
+        // Based on:
+        // * https://github.com/gfx-rs/wgpu/pull/2528
+        // * https://github.com/gpuweb/gpuweb/issues/1325#issuecomment-761041326
+        let timestamp_period = if self.shared.device.lock().name().starts_with("Intel") {
+            83.333
+        } else {
+            // Known for Apple Silicon (at least M1 & M2, iPad Pro 2018) and AMD GPUs.
+            1.0
+        };
+
         Ok(crate::OpenDevice {
             device: super::Device {
                 shared: Arc::clone(&self.shared),
@@ -34,6 +61,7 @@ impl crate::Adapter<super::Api> for super::Adapter {
             },
             queue: super::Queue {
                 raw: Arc::new(Mutex::new(queue)),
+                timestamp_period,
             },
         })
     }
@@ -50,9 +78,9 @@ impl crate::Adapter<super::Api> for super::Adapter {
         // https://developer.apple.com/documentation/metal/mtlreadwritetexturetier/mtlreadwritetexturetier1?language=objc
         // https://developer.apple.com/documentation/metal/mtlreadwritetexturetier/mtlreadwritetexturetier2?language=objc
         let (read_write_tier1_if, read_write_tier2_if) = match pc.read_write_texture_tier {
-            mtl::MTLReadWriteTextureTier::TierNone => (Tfc::empty(), Tfc::empty()),
-            mtl::MTLReadWriteTextureTier::Tier1 => (Tfc::STORAGE_READ_WRITE, Tfc::empty()),
-            mtl::MTLReadWriteTextureTier::Tier2 => {
+            metal::MTLReadWriteTextureTier::TierNone => (Tfc::empty(), Tfc::empty()),
+            metal::MTLReadWriteTextureTier::Tier1 => (Tfc::STORAGE_READ_WRITE, Tfc::empty()),
+            metal::MTLReadWriteTextureTier::Tier2 => {
                 (Tfc::STORAGE_READ_WRITE, Tfc::STORAGE_READ_WRITE)
             }
         };
@@ -221,7 +249,7 @@ impl crate::Adapter<super::Api> for super::Adapter {
             | Tf::Bc5RgUnorm
             | Tf::Bc5RgSnorm
             | Tf::Bc6hRgbUfloat
-            | Tf::Bc6hRgbSfloat
+            | Tf::Bc6hRgbFloat
             | Tf::Bc7RgbaUnorm
             | Tf::Bc7RgbaUnormSrgb => {
                 if pc.format_bc {
@@ -437,14 +465,14 @@ const DEPTH_CLIP_MODE: &[MTLFeatureSet] = &[
 const OS_NOT_SUPPORT: (usize, usize) = (10000, 0);
 
 impl super::PrivateCapabilities {
-    fn supports_any(raw: &mtl::DeviceRef, features_sets: &[MTLFeatureSet]) -> bool {
+    fn supports_any(raw: &metal::DeviceRef, features_sets: &[MTLFeatureSet]) -> bool {
         features_sets
             .iter()
             .cloned()
             .any(|x| raw.supports_feature_set(x))
     }
 
-    pub fn new(device: &mtl::Device) -> Self {
+    pub fn new(device: &metal::Device) -> Self {
         #[repr(C)]
         #[derive(Clone, Copy, Debug)]
         #[allow(clippy::upper_case_acronyms)]
@@ -452,12 +480,16 @@ impl super::PrivateCapabilities {
             major: usize,
             minor: usize,
             patch: usize,
-            is_mac: bool,
         }
 
         impl NSOperatingSystemVersion {
-            fn at_least(&self, mac_version: (usize, usize), ios_version: (usize, usize)) -> bool {
-                if self.is_mac {
+            fn at_least(
+                &self,
+                mac_version: (usize, usize),
+                ios_version: (usize, usize),
+                is_mac: bool,
+            ) -> bool {
+                if is_mac {
                     self.major > mac_version.0
                         || (self.major == mac_version.0 && self.minor >= mac_version.1)
                 } else {
@@ -467,15 +499,14 @@ impl super::PrivateCapabilities {
             }
         }
 
-        let mut version: NSOperatingSystemVersion = unsafe {
+        let version: NSOperatingSystemVersion = unsafe {
             let process_info: *mut objc::runtime::Object =
                 msg_send![class!(NSProcessInfo), processInfo];
             msg_send![process_info, operatingSystemVersion]
         };
 
         let os_is_mac = device.supports_feature_set(MTLFeatureSet::macOS_GPUFamily1_v1);
-        version.is_mac = os_is_mac;
-        let family_check = version.at_least((10, 15), (13, 0));
+        let family_check = version.at_least((10, 15), (13, 0), os_is_mac);
 
         let mut sample_count_mask = crate::TextureFormatCapabilities::MULTISAMPLE_X4; // 1 and 4 samples are supported on all devices
         if device.supports_texture_sample_count(2) {
@@ -488,9 +519,9 @@ impl super::PrivateCapabilities {
             sample_count_mask |= crate::TextureFormatCapabilities::MULTISAMPLE_X16;
         }
 
-        let rw_texture_tier = if version.at_least((10, 13), (11, 0)) {
+        let rw_texture_tier = if version.at_least((10, 13), (11, 0), os_is_mac) {
             device.read_write_texture_support()
-        } else if version.at_least((10, 12), OS_NOT_SUPPORT) {
+        } else if version.at_least((10, 12), OS_NOT_SUPPORT, os_is_mac) {
             if Self::supports_any(device, &[MTLFeatureSet::macOS_ReadWriteTextureTier2]) {
                 MTLReadWriteTextureTier::Tier2
             } else {
@@ -502,25 +533,25 @@ impl super::PrivateCapabilities {
 
         Self {
             family_check,
-            msl_version: if version.at_least((12, 0), (15, 0)) {
+            msl_version: if version.at_least((12, 0), (15, 0), os_is_mac) {
                 MTLLanguageVersion::V2_4
-            } else if version.at_least((11, 0), (14, 0)) {
+            } else if version.at_least((11, 0), (14, 0), os_is_mac) {
                 MTLLanguageVersion::V2_3
-            } else if version.at_least((10, 15), (13, 0)) {
+            } else if version.at_least((10, 15), (13, 0), os_is_mac) {
                 MTLLanguageVersion::V2_2
-            } else if version.at_least((10, 14), (12, 0)) {
+            } else if version.at_least((10, 14), (12, 0), os_is_mac) {
                 MTLLanguageVersion::V2_1
-            } else if version.at_least((10, 13), (11, 0)) {
+            } else if version.at_least((10, 13), (11, 0), os_is_mac) {
                 MTLLanguageVersion::V2_0
-            } else if version.at_least((10, 12), (10, 0)) {
+            } else if version.at_least((10, 12), (10, 0), os_is_mac) {
                 MTLLanguageVersion::V1_2
-            } else if version.at_least((10, 11), (9, 0)) {
+            } else if version.at_least((10, 11), (9, 0), os_is_mac) {
                 MTLLanguageVersion::V1_1
             } else {
                 MTLLanguageVersion::V1_0
             },
             // macOS 10.11 doesn't support read-write resources
-            fragment_rw_storage: version.at_least((10, 12), (8, 0)),
+            fragment_rw_storage: version.at_least((10, 12), (8, 0), os_is_mac),
             read_write_texture_tier: rw_texture_tier,
             msaa_desktop: os_is_mac,
             msaa_apple3: if family_check {
@@ -537,7 +568,6 @@ impl super::PrivateCapabilities {
                 MUTABLE_COMPARISON_SAMPLER_SUPPORT,
             ),
             sampler_clamp_to_border: Self::supports_any(device, SAMPLER_CLAMP_TO_BORDER_SUPPORT),
-            sampler_lod_average: { version.at_least((11, 0), (9, 0)) },
             base_instance: Self::supports_any(device, BASE_INSTANCE_SUPPORT),
             base_vertex_instance_drawing: Self::supports_any(device, BASE_VERTEX_INSTANCE_SUPPORT),
             dual_source_blending: Self::supports_any(device, DUAL_SOURCE_BLEND_SUPPORT),
@@ -626,9 +656,9 @@ impl super::PrivateCapabilities {
             },
             max_samplers_per_stage: 16,
             buffer_alignment: if os_is_mac { 256 } else { 64 },
-            max_buffer_size: if version.at_least((10, 14), (12, 0)) {
+            max_buffer_size: if version.at_least((10, 14), (12, 0), os_is_mac) {
                 // maxBufferLength available on macOS 10.14+ and iOS 12.0+
-                let buffer_size: mtl::NSInteger =
+                let buffer_size: metal::NSInteger =
                     unsafe { msg_send![device.as_ref(), maxBufferLength] };
                 buffer_size as _
             } else if os_is_mac {
@@ -710,10 +740,10 @@ impl super::PrivateCapabilities {
             supports_binary_archives: family_check
                 && (device.supports_family(MTLGPUFamily::Apple3)
                     || device.supports_family(MTLGPUFamily::Mac1)),
-            supports_capture_manager: version.at_least((10, 13), (11, 0)),
-            can_set_maximum_drawables_count: version.at_least((10, 14), (11, 2)),
-            can_set_display_sync: version.at_least((10, 13), OS_NOT_SUPPORT),
-            can_set_next_drawable_timeout: version.at_least((10, 13), (11, 0)),
+            supports_capture_manager: version.at_least((10, 13), (11, 0), os_is_mac),
+            can_set_maximum_drawables_count: version.at_least((10, 14), (11, 2), os_is_mac),
+            can_set_display_sync: version.at_least((10, 13), OS_NOT_SUPPORT, os_is_mac),
+            can_set_next_drawable_timeout: version.at_least((10, 13), (11, 0), os_is_mac),
             supports_arrays_of_textures: Self::supports_any(
                 device,
                 &[
@@ -726,18 +756,25 @@ impl super::PrivateCapabilities {
                 && (device.supports_family(MTLGPUFamily::Apple6)
                     || device.supports_family(MTLGPUFamily::Mac1)
                     || device.supports_family(MTLGPUFamily::MacCatalyst1)),
-            supports_mutability: version.at_least((10, 13), (11, 0)),
+            supports_mutability: version.at_least((10, 13), (11, 0), os_is_mac),
             //Depth clipping is supported on all macOS GPU families and iOS family 4 and later
             supports_depth_clip_control: os_is_mac
                 || device.supports_feature_set(MTLFeatureSet::iOS_GPUFamily4_v1),
-            supports_preserve_invariance: version.at_least((11, 0), (13, 0)),
+            supports_preserve_invariance: version.at_least((11, 0), (13, 0), os_is_mac),
             // Metal 2.2 on mac, 2.3 on iOS.
-            supports_shader_primitive_index: version.at_least((10, 15), (14, 0)),
-            has_unified_memory: if version.at_least((10, 15), (13, 0)) {
+            supports_shader_primitive_index: version.at_least((10, 15), (14, 0), os_is_mac),
+            has_unified_memory: if version.at_least((10, 15), (13, 0), os_is_mac) {
                 Some(device.has_unified_memory())
             } else {
                 None
             },
+            support_timestamp_query: version.at_least((11, 0), (14, 0), os_is_mac)
+                && device
+                    .supports_counter_sampling(metal::MTLCounterSamplingPoint::AtStageBoundary),
+            support_timestamp_query_in_passes: version.at_least((11, 0), (14, 0), os_is_mac)
+                && device.supports_counter_sampling(metal::MTLCounterSamplingPoint::AtDrawBoundary)
+                && device
+                    .supports_counter_sampling(metal::MTLCounterSamplingPoint::AtDispatchBoundary),
         }
     }
 
@@ -761,11 +798,17 @@ impl super::PrivateCapabilities {
             | F::POLYGON_MODE_LINE
             | F::CLEAR_TEXTURE
             | F::TEXTURE_FORMAT_16BIT_NORM
-            | F::SHADER_FLOAT16
+            | F::SHADER_F16
             | F::DEPTH32FLOAT_STENCIL8
             | F::MULTI_DRAW_INDIRECT;
 
-        features.set(F::TEXTURE_COMPRESSION_ASTC_LDR, self.format_astc);
+        features.set(F::TIMESTAMP_QUERY, self.support_timestamp_query);
+        // TODO: Not yet implemented.
+        // features.set(
+        //     F::TIMESTAMP_QUERY_INSIDE_PASSES,
+        //     self.support_timestamp_query_in_passes,
+        // );
+        features.set(F::TEXTURE_COMPRESSION_ASTC, self.format_astc);
         features.set(F::TEXTURE_COMPRESSION_ASTC_HDR, self.format_astc_hdr);
         features.set(F::TEXTURE_COMPRESSION_BC, self.format_bc);
         features.set(F::TEXTURE_COMPRESSION_ETC2, self.format_eac_etc);
@@ -797,6 +840,8 @@ impl super::PrivateCapabilities {
             self.sampler_clamp_to_border,
         );
         features.set(F::ADDRESS_MODE_CLAMP_TO_ZERO, true);
+
+        features.set(F::RG11B10UFLOAT_RENDERABLE, self.format_rg11b10_all);
 
         features
     }
@@ -863,8 +908,8 @@ impl super::PrivateCapabilities {
         }
     }
 
-    pub fn map_format(&self, format: wgt::TextureFormat) -> mtl::MTLPixelFormat {
-        use mtl::MTLPixelFormat::*;
+    pub fn map_format(&self, format: wgt::TextureFormat) -> metal::MTLPixelFormat {
+        use metal::MTLPixelFormat::*;
         use wgt::TextureFormat as Tf;
         match format {
             Tf::R8Unorm => R8Unorm,
@@ -937,7 +982,7 @@ impl super::PrivateCapabilities {
             Tf::Bc4RSnorm => BC4_RSnorm,
             Tf::Bc5RgUnorm => BC5_RGUnorm,
             Tf::Bc5RgSnorm => BC5_RGSnorm,
-            Tf::Bc6hRgbSfloat => BC6H_RGBFloat,
+            Tf::Bc6hRgbFloat => BC6H_RGBFloat,
             Tf::Bc6hRgbUfloat => BC6H_RGBUfloat,
             Tf::Bc7RgbaUnorm => BC7_RGBAUnorm,
             Tf::Bc7RgbaUnormSrgb => BC7_RGBAUnorm_sRGB,
@@ -1008,9 +1053,9 @@ impl super::PrivateCapabilities {
         &self,
         format: wgt::TextureFormat,
         aspects: crate::FormatAspects,
-    ) -> mtl::MTLPixelFormat {
+    ) -> metal::MTLPixelFormat {
         use crate::FormatAspects as Fa;
-        use mtl::MTLPixelFormat::*;
+        use metal::MTLPixelFormat::*;
         use wgt::TextureFormat as Tf;
         match (format, aspects) {
             // map combined depth-stencil format to their stencil-only format
@@ -1030,7 +1075,7 @@ impl super::PrivateCapabilities {
 }
 
 impl super::PrivateDisabilities {
-    pub fn new(device: &mtl::Device) -> Self {
+    pub fn new(device: &metal::Device) -> Self {
         let is_intel = device.name().starts_with("Intel");
         Self {
             broken_viewport_near_depth: is_intel

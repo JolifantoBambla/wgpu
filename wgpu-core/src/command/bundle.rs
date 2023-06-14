@@ -71,8 +71,8 @@ called. It goes through the commands and issues them into the native command
 buffer. Thanks to isolation, it doesn't track any bind group invalidations or
 index format changes.
 
-[Gdcrbe]: crate::hub::Global::device_create_render_bundle_encoder
-[Grbef]: crate::hub::Global::render_bundle_encoder_finish
+[Gdcrbe]: crate::global::Global::device_create_render_bundle_encoder
+[Grbef]: crate::global::Global::render_bundle_encoder_finish
 [wrpeb]: crate::command::render_ffi::wgpu_render_pass_execute_bundles
 !*/
 
@@ -86,15 +86,18 @@ use crate::{
     },
     conv,
     device::{
-        AttachmentData, Device, DeviceError, MissingDownlevelFlags, RenderPassContext,
-        SHADER_STAGE_COUNT,
+        AttachmentData, Device, DeviceError, MissingDownlevelFlags,
+        RenderPassCompatibilityCheckType, RenderPassContext, SHADER_STAGE_COUNT,
     },
     error::{ErrorFormatter, PrettyError},
-    hub::{GlobalIdentityHandlerFactory, HalApi, Hub, Resource, Storage, Token},
+    hal_api::HalApi,
+    hub::{Hub, Token},
     id,
+    identity::GlobalIdentityHandlerFactory,
     init_tracker::{BufferInitTrackerAction, MemoryInitKind, TextureInitTrackerAction},
     pipeline::{self, PipelineFlags},
-    resource,
+    resource::{self, Resource},
+    storage::Storage,
     track::RenderBundleScope,
     validation::check_buffer_usage,
     Label, LabelHelpers, LifeGuard, Stored,
@@ -302,7 +305,7 @@ impl RenderBundleEncoder {
                         .map_pass_err(scope)?;
 
                     let max_bind_groups = device.limits.max_bind_groups;
-                    if (index as u32) >= max_bind_groups {
+                    if index >= max_bind_groups {
                         return Err(RenderCommandError::BindGroupIndexOutOfRange {
                             index,
                             max: max_bind_groups,
@@ -367,7 +370,7 @@ impl RenderBundleEncoder {
                         .map_pass_err(scope)?;
 
                     self.context
-                        .check_compatible(&pipeline.pass_context)
+                        .check_compatible(&pipeline.pass_context, RenderPassCompatibilityCheckType::RenderPipeline)
                         .map_err(RenderCommandError::IncompatiblePipelineTargets)
                         .map_pass_err(scope)?;
 
@@ -633,7 +636,7 @@ impl RenderBundleEncoder {
                 RenderCommand::PushDebugGroup { color: _, len: _ } => unimplemented!(),
                 RenderCommand::InsertDebugMarker { color: _, len: _ } => unimplemented!(),
                 RenderCommand::PopDebugGroup => unimplemented!(),
-                RenderCommand::WriteTimestamp { .. } // Must check the WRITE_TIMESTAMP_INSIDE_PASSES feature
+                RenderCommand::WriteTimestamp { .. } // Must check the TIMESTAMP_QUERY_INSIDE_PASSES feature
                 | RenderCommand::BeginPipelineStatisticsQuery { .. }
                 | RenderCommand::EndPipelineStatisticsQuery => unimplemented!(),
                 RenderCommand::ExecuteBundle(_)
@@ -695,19 +698,21 @@ impl RenderBundleEncoder {
 
 /// Error type returned from `RenderBundleEncoder::new` if the sample count is invalid.
 #[derive(Clone, Debug, Error)]
+#[non_exhaustive]
 pub enum CreateRenderBundleError {
     #[error(transparent)]
     ColorAttachment(#[from] ColorAttachmentError),
-    #[error("invalid number of samples {0}")]
+    #[error("Invalid number of samples {0}")]
     InvalidSampleCount(u32),
 }
 
 /// Error type returned from `RenderBundleEncoder::new` if the sample count is invalid.
 #[derive(Clone, Debug, Error)]
+#[non_exhaustive]
 pub enum ExecutionError {
-    #[error("buffer {0:?} is destroyed")]
+    #[error("Buffer {0:?} is destroyed")]
     DestroyedBuffer(id::BufferId),
-    #[error("using {0} in a render bundle is not implemented")]
+    #[error("Using {0} in a render bundle is not implemented")]
     Unimplemented(&'static str),
 }
 impl PrettyError for ExecutionError {
@@ -782,7 +787,7 @@ impl<A: HalApi> RenderBundle<A> {
                     unsafe {
                         raw.set_bind_group(
                             &pipeline_layout_guard[pipeline_layout_id.unwrap()].raw,
-                            index as u32,
+                            index,
                             &bind_group.raw,
                             &offsets[..num_dynamic_offsets as usize],
                         )
@@ -1220,7 +1225,7 @@ impl<A: HalApi> State<A> {
 
     fn set_bind_group(
         &mut self,
-        slot: u8,
+        slot: u32,
         bind_group_id: id::BindGroupId,
         layout_id: id::Valid<id::BindGroupLayoutId>,
         dynamic_offsets: Range<usize>,
@@ -1363,7 +1368,7 @@ impl<A: HalApi> State<A> {
                         contents.is_dirty = false;
                         let offsets = &contents.dynamic_offsets;
                         return Some(RenderCommand::SetBindGroup {
-                            index: i as u8,
+                            index: i.try_into().unwrap(),
                             bind_group_id: contents.bind_group_id,
                             num_dynamic_offsets: (offsets.end - offsets.start) as u8,
                         });
@@ -1377,7 +1382,7 @@ impl<A: HalApi> State<A> {
 /// Error encountered when finishing recording a render bundle.
 #[derive(Clone, Debug, Error)]
 pub(super) enum RenderBundleErrorInner {
-    #[error("resource is not valid to use with this render bundle because the resource and the bundle come from different devices")]
+    #[error("Resource is not valid to use with this render bundle because the resource and the bundle come from different devices")]
     NotValidToUse,
     #[error(transparent)]
     Device(#[from] DeviceError),
@@ -1467,7 +1472,7 @@ pub mod bundle_ffi {
         }
 
         bundle.base.commands.push(RenderCommand::SetBindGroup {
-            index: index.try_into().unwrap(),
+            index,
             num_dynamic_offsets: offset_length.try_into().unwrap(),
             bind_group_id,
         });

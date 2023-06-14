@@ -42,13 +42,18 @@ pub mod command;
 mod conv;
 pub mod device;
 pub mod error;
+pub mod global;
+pub mod hal_api;
 pub mod hub;
 pub mod id;
+pub mod identity;
 mod init_tracker;
 pub mod instance;
 pub mod pipeline;
 pub mod present;
+pub mod registry;
 pub mod resource;
+pub mod storage;
 mod track;
 mod validation;
 
@@ -280,19 +285,30 @@ platform supports.";
 /// Define an exported macro named `$public` that expands to an expression if
 /// the feature `$feature` is enabled, or to a panic otherwise.
 ///
+/// This is used in the definition of `gfx_select!`, to dispatch the
+/// call to the appropriate backend, but panic if that backend was not
+/// compiled in.
+///
 /// For a call like this:
 ///
-///    define_backend_caller! { name, hidden_name, feature }
+/// ```ignore
+/// define_backend_caller! { name, private, "feature" if cfg_condition }
+/// ```
 ///
 /// define a macro `name`, used like this:
 ///
-///    name!(expr)
+/// ```ignore
+/// name!(expr)
+/// ```
 ///
-/// that expands to `expr` if `feature` is enabled, or a panic otherwise.
+/// that expands to `expr` if `#[cfg(cfg_condition)]` is enabled, or a
+/// panic otherwise. The panic message complains that `"feature"` is
+/// not enabled.
 ///
-/// Because of odd technical limitations on exporting macros expanded by other
-/// macros, you must supply both a public-facing name for the macro and a
-/// private name, which is never used outside this macro. For details:
+/// Because of odd technical limitations on exporting macros expanded
+/// by other macros, you must supply both a public-facing name for the
+/// macro and a private name, `$private`, which is never used
+/// outside this macro. For details:
 /// <https://github.com/rust-lang/rust/pull/52234#issuecomment-976702997>
 macro_rules! define_backend_caller {
     { $public:ident, $private:ident, $feature:literal if $cfg:meta } => {
@@ -344,7 +360,7 @@ define_backend_caller! { gfx_if_gles, gfx_if_gles_hidden, "gles" if feature = "g
 /// identifiers to select backends dynamically, even though many `wgpu_core`
 /// methods are compiled and optimized for a specific back end.
 ///
-/// This macro is typically used to call methods on [`wgpu_core::hub::Global`],
+/// This macro is typically used to call methods on [`wgpu_core::global::Global`],
 /// many of which take a single `hal::Api` type parameter. For example, to
 /// create a new buffer on the device indicated by `device_id`, one would say:
 ///
@@ -364,13 +380,13 @@ define_backend_caller! { gfx_if_gles, gfx_if_gles_hidden, "gles" if feature = "g
 /// That `gfx_select!` call uses `device_id`'s backend to select the right
 /// backend type `A` for a call to `Global::device_create_buffer<A>`.
 ///
-/// However, there's nothing about this macro that is specific to `hub::Global`.
+/// However, there's nothing about this macro that is specific to `global::Global`.
 /// For example, Firefox's embedding of `wgpu_core` defines its own types with
 /// methods that take `hal::Api` type parameters. Firefox uses `gfx_select!` to
 /// dynamically dispatch to the right specialization based on the resource's id.
 ///
 /// [`wgpu_types::Backend`]: wgt::Backend
-/// [`wgpu_core::hub::Global`]: crate::hub::Global
+/// [`wgpu_core::global::Global`]: crate::global::Global
 /// [`Id`]: id::Id
 #[macro_export]
 macro_rules! gfx_select {
@@ -388,9 +404,10 @@ macro_rules! gfx_select {
 
 /// Fast hash map used internally.
 type FastHashMap<K, V> =
-    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<fxhash::FxHasher>>;
+    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
 /// Fast hash set used internally.
-type FastHashSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<fxhash::FxHasher>>;
+type FastHashSet<K> =
+    std::collections::HashSet<K, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
 
 #[inline]
 pub(crate) fn get_lowest_common_denom(a: u32, b: u32) -> u32 {

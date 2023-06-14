@@ -152,7 +152,7 @@ impl framework::Example for Example {
                     fragment: Some(wgpu::FragmentState {
                         module: &shader_triangle_and_lines,
                         entry_point: "fs_main_white",
-                        targets: &[Some(config.format.into())],
+                        targets: &[Some(config.view_formats[0].into())],
                     }),
                     primitive: wgpu::PrimitiveState {
                         polygon_mode: wgpu::PolygonMode::Line,
@@ -213,7 +213,7 @@ impl framework::Example for Example {
                     fragment: Some(wgpu::FragmentState {
                         module: &shader,
                         entry_point: "fs_main",
-                        targets: &[Some(config.format.into())],
+                        targets: &[Some(config.view_formats[0].into())],
                     }),
                     primitive: wgpu::PrimitiveState::default(),
                     depth_stencil: None,
@@ -276,6 +276,7 @@ impl framework::Example for Example {
                     },
                 })],
                 depth_stencil_attachment: None,
+                timestamp_writes: None,
             });
 
             rpass.set_pipeline(&self.pipeline_triangle_conservative);
@@ -295,6 +296,7 @@ impl framework::Example for Example {
                     },
                 })],
                 depth_stencil_attachment: None,
+                timestamp_writes: None,
             });
 
             rpass.set_pipeline(&self.pipeline_upscale);

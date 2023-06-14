@@ -21,9 +21,13 @@ use crate::error::{ErrorFormatter, PrettyError};
 use crate::init_tracker::BufferInitTrackerAction;
 use crate::track::{Tracker, UsageScope};
 use crate::{
-    hub::{Global, GlobalIdentityHandlerFactory, HalApi, Storage, Token},
+    global::Global,
+    hal_api::HalApi,
+    hub::Token,
     id,
+    identity::GlobalIdentityHandlerFactory,
     resource::{Buffer, Texture},
+    storage::Storage,
     Label, Stored,
 };
 
@@ -51,6 +55,15 @@ struct CommandEncoder<A: hal::Api> {
 
 //TODO: handle errors better
 impl<A: hal::Api> CommandEncoder<A> {
+    /// Closes the live encoder
+    fn close_and_swap(&mut self) {
+        if self.is_open {
+            self.is_open = false;
+            let new = unsafe { self.raw.end_encoding().unwrap() };
+            self.list.insert(self.list.len() - 1, new);
+        }
+    }
+
     fn close(&mut self) {
         if self.is_open {
             self.is_open = false;
@@ -99,6 +112,7 @@ pub struct CommandBuffer<A: HalApi> {
     pub(crate) trackers: Tracker<A>,
     buffer_memory_init_actions: Vec<BufferInitTrackerAction>,
     texture_memory_actions: CommandBufferTextureMemoryActions,
+    pub(crate) pending_query_resets: QueryResetMap<A>,
     limits: wgt::Limits,
     support_clear_texture: bool,
     #[cfg(feature = "trace")]
@@ -127,6 +141,7 @@ impl<A: HalApi> CommandBuffer<A> {
             trackers: Tracker::new(),
             buffer_memory_init_actions: Default::default(),
             texture_memory_actions: Default::default(),
+            pending_query_resets: QueryResetMap::new(),
             limits,
             support_clear_texture: features.contains(wgt::Features::CLEAR_TEXTURE),
             #[cfg(feature = "trace")]
@@ -227,7 +242,7 @@ impl<A: HalApi> CommandBuffer<A> {
     }
 }
 
-impl<A: HalApi> crate::hub::Resource for CommandBuffer<A> {
+impl<A: HalApi> crate::resource::Resource for CommandBuffer<A> {
     const TYPE: &'static str = "CommandBuffer";
 
     fn life_guard(&self) -> &crate::LifeGuard {
@@ -328,10 +343,11 @@ impl<C: Clone> BasePass<C> {
 }
 
 #[derive(Clone, Debug, Error)]
+#[non_exhaustive]
 pub enum CommandEncoderError {
-    #[error("command encoder is invalid")]
+    #[error("Command encoder is invalid")]
     Invalid,
-    #[error("command encoder must be active")]
+    #[error("Command encoder must be active")]
     NotRecording,
 }
 
